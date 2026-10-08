@@ -1,0 +1,6 @@
+.git
+bin
+bench/logs
+bench/run.out
+bench/run.err
+state

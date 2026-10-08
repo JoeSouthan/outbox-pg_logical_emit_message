@@ -1,0 +1,100 @@
+# Nothing is published on host ports: every component runs inside the compose network.
+# There is no Pub/Sub emulator: the relays default to a simulated sink that costs a fixed
+# latency per publish batch, and can publish to a real Pub/Sub project when configured.
+services:
+  postgres:
+    image: postgres:18
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=512MB
+      # Cap WAL retained by a lagging slot so the prototype shows slot invalidation
+      # rather than filling the disk. Raise or remove in real use.
+      - -c
+      - max_slot_wal_keep_size=2GB
+    environment:
+      POSTGRES_USER: outbox
+      POSTGRES_PASSWORD: outbox
+      POSTGRES_DB: outbox
+    shm_size: 256mb
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U outbox -d outbox"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Transaction-mode pooler in front of Postgres. The producer goes through this to prove
+  # the transports work without session state. Relays must bypass it: replication
+  # connections cannot go through PgBouncer.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: outbox
+      DB_PASSWORD: outbox
+      DB_NAME: outbox
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 64
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # The three Go services carry the `bench` profile so a plain `docker compose up` starts
+  # only the infrastructure; `docker compose run` targets them directly.
+  #   docker compose run --rm relay                                  # log-message relay for target_1
+  #   docker compose run --rm -e RELAY_TARGET=target_2 relay         # another relay: own slot, own topic
+  #   docker compose run --rm -e RELAY_JOURNAL=true relay            # same, with journal recovery
+  #   docker compose run --rm relay /tablerelay                      # table-outbox baseline relay
+  #   docker compose run --rm consumer                               # real Pub/Sub only: prints what arrives for target_1
+  #   docker compose run --rm producer -events 10000 -workers 16     # load, default mode wal
+  #   bench/run.sh                                                   # full benchmark
+  relay:
+    build: ./relay
+    profiles: [bench]
+    environment:
+      RELAY_DSN: postgres://outbox:outbox@postgres:5432/outbox?replication=database
+      RELAY_JOURNAL_DSN: postgres://outbox:outbox@postgres:5432/outbox
+      RELAY_TARGET: target_1
+      RELAY_STATE_DIR: /state
+      # RELAY_SINK: simulated (default) costs RELAY_SINK_LATENCY per publish batch and
+      # sends nothing. RELAY_SINK=pubsub publishes to a real Pub/Sub project: set
+      # PUBSUB_PROJECT_ID and mount credentials (GOOGLE_APPLICATION_CREDENTIALS).
+      RELAY_SINK: simulated
+      RELAY_SINK_LATENCY: 200ms
+    volumes:
+      - ./state:/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Only useful against a real Pub/Sub project (there is no emulator in this stack):
+  # set PUBSUB_PROJECT_ID and mount credentials.
+  consumer:
+    build: ./consumer
+    profiles: [bench]
+    environment:
+      RELAY_TARGET: target_1
+
+  producer:
+    build: ./producer
+    profiles: [bench]
+    environment:
+      PRODUCER_DSN: postgres://outbox:outbox@pgbouncer:5432/outbox
+      OUTBOX_MODE: wal
+      OUTBOX_TARGETS: target_1
+    depends_on:
+      pgbouncer:
+        condition: service_started
