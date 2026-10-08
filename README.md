@@ -145,7 +145,7 @@ sequenceDiagram
     PG-->>R: BEGIN xid
     PG-->>R: MESSAGE prefix=target_1 payload
     PG-->>R: COMMIT lsn
-    R->>R: buffer; flush on batch size or interval
+    R->>R: buffer, flush on batch size or interval
     R->>PS: publish batch (ordering key = payload.key)
     PS-->>R: all acked
     R->>PG: standby status: last fully published COMMIT lsn
@@ -167,3 +167,97 @@ sequenceDiagram
 
 Requirements: Postgres 14+ for pgoutput messages (the function itself is 9.6+), a
 role with `REPLICATION`, `wal_level=logical`, a free `max_replication_slots`.
+
+## Journal recovery and position tracking
+
+The journal exists for one case: the relay comes back and its slot is gone. Everything
+else about it is designed so that case can be handled exactly, without reading the
+journal at any other time.
+
+**What the producer writes.** One statement per event:
+
+```sql
+INSERT INTO outbox_journal (target, payload, lsn)
+VALUES ($1, $2, pg_logical_emit_message(true, $1, $2));
+```
+
+`pg_logical_emit_message` returns the log position of the record it just wrote, and the
+INSERT stores it in the row. Both happen inside the business transaction, so a rollback
+discards both. Nothing ever updates or deletes a journal row. The table is partitioned by
+day on `created_at` and old partitions are dropped after a retention period, so it costs
+one insert per event and never produces a dead tuple.
+
+**What the relay tracks.** Two positions, kept in two places:
+
+| position | where it lives | what it means |
+|---|---|---|
+| `confirmed_flush_lsn` | the slot, in Postgres | Postgres may discard log before this; the relay advances it with a standby status update after a batch is published |
+| last acknowledged LSN | the relay's state file, `state/relay_<target>.lsn` | the relay's own copy of the same number, written atomically (temp file and rename) every time it acknowledges |
+
+In steady state the two agree. The state file exists because the slot is the thing that
+disappears in a failover, and the number it held is the only thing that defines the
+lost window. In production this file belongs on durable storage outside the database
+that just failed over: a small table in another database, an object store, or the relay's
+own persistent volume.
+
+**The acknowledgement rule.** The relay only acknowledges up to the end of a source
+transaction whose messages have all been published. A batch that flushes in the middle
+of a transaction publishes those messages but leaves the acknowledged position at the
+previous commit, so a crash replays that whole transaction. Non-transactional messages
+have no commit record and never advance the position. This is what makes delivery
+at-least-once rather than at-most-once, and why consumers dedupe on the message id.
+
+**What happens on start.** The relay tries to create its slot, then branches on two
+facts: did the slot already exist, and does a state file exist.
+
+```mermaid
+flowchart TD
+  S([relay starts]) --> C{slot exists?}
+  C -->|yes| R[resume at 0/0, i.e. the slot's confirmed_flush_lsn]
+  C -->|no, created now| F{state file exists?}
+  F -->|no| N[first run, nothing before the slot's start can be streamed, write state = start]
+  F -->|yes, journal mode| J[replay journal rows with lsn in last acked to slot start, then stream]
+  F -->|yes, wal mode| W[log a warning, the window is lost, then stream]
+  R --> T[stream, publish, ack, write state]
+  N --> T
+  J --> T
+  W --> T
+```
+
+The slot-exists path is the normal restart. The created-now path with a state file is a
+failover or an operator dropping the slot: the gap between the state file's position
+and the new slot's consistent point is exactly what was committed while no slot was
+retaining log, and the journal holds it.
+
+**The replay itself.** Over an ordinary connection, not the replication one:
+
+```sql
+SELECT payload, lsn::text
+FROM outbox_journal
+WHERE target = $1 AND lsn > $2::pg_lsn AND lsn <= $3::pg_lsn
+ORDER BY lsn, id;
+```
+
+`$2` is the state file's position and `$3` the new slot's consistent point. The rows go
+through the same sink in relay-sized batches, with a `replayed=true` attribute, and the
+state file is then set to the consistent point. Only after that does streaming begin, so
+a crash during replay simply replays again from the same position. The benchmark's
+slot-loss run replayed exactly 100,000 rows this way in 24.4 seconds.
+
+**The boundary edge.** The stored `lsn` is where the message was written, which is
+before its transaction's commit record. A transaction that wrote its message early and
+committed late can have a position below one the relay has already acknowledged, while
+still being streamed correctly in normal operation because streaming is commit-ordered.
+After a slot loss, though, replaying strictly from the acknowledged position would miss
+it. Two mitigations: widen the window downward by a margin at least as large as the
+longest transaction the producers run, and rely on consumer dedupe for the duplicates
+that margin creates. The prototype replays from the exact position; a production relay
+should apply the margin.
+
+**Per target.** Each target has its own slot, its own state file and its own replay
+query, because each relay acknowledges independently. A failover therefore produces one
+recovery per relay, each bounded by its own last acknowledgement.
+
+**Retention is the one knob.** The journal can only recover what it still holds. Keep
+partitions for longer than the longest relay outage you intend to survive, and alert on
+journal partition age against that, the same way you alert on slot lag.

@@ -66,7 +66,9 @@ one insert per event and produces no dead tuples. When a relay reconnects and fi
 slot gone, it creates a new one, which returns the position the new stream starts
 from, replays the journal rows for its target between its last acknowledged position
 and that start, then streams. The relay keeps its last acknowledged position in a
-state file outside Postgres for exactly this purpose.
+state file outside Postgres for exactly this purpose; the README's "Journal recovery
+and position tracking" section walks through the start-up branches, the replay query,
+the boundary edge and what to persist where.
 
 ## Targets
 
